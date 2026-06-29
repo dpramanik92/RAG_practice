@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Pre-push hook: blocks pushes containing secrets in diffs or notebook outputs.
+# Activate with: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+SECRET_PATTERNS=(
+  'lsv2_pt_[a-zA-Z0-9_]{20,}'
+  'sk-[a-zA-Z0-9]{20,}'
+  'sk-ant-[a-zA-Z0-9\-]{20,}'
+  'hf_[a-zA-Z0-9]{20,}'
+  'api[_-]?key[[:space:]]*[:=][[:space:]]*["'"'"'][a-zA-Z0-9\-_]{16,}'
+  'Bearer [a-zA-Z0-9\-_\.]{20,}'
+)
+
+FOUND=0
+
+check_diff() {
+  local commit="$1"
+  local diff
+  diff=$(git diff-tree --no-commit-id -p "$commit" 2>/dev/null) || return
+
+  for pattern in "${SECRET_PATTERNS[@]}"; do
+    local matches
+    matches=$(echo "$diff" | grep -nE "^\+.*${pattern}" || true)
+    if [[ -n "$matches" ]]; then
+      echo "  [SECRET FOUND] Commit $commit matched pattern: $pattern"
+      echo "$matches" | head -5
+      FOUND=1
+    fi
+  done
+
+  # Extra check: scan .ipynb cell outputs as JSON
+  local changed_notebooks
+  changed_notebooks=$(git diff-tree --no-commit-id --name-only -r "$commit" 2>/dev/null | grep '\.ipynb$' || true)
+
+  for nb in $changed_notebooks; do
+    local content
+    content=$(git show "${commit}:${nb}" 2>/dev/null) || continue
+
+    for pattern in "${SECRET_PATTERNS[@]}"; do
+      local nb_matches
+      nb_matches=$(echo "$content" | python3 -c "
+import sys, json, re
+try:
+    nb = json.load(sys.stdin)
+    for i, cell in enumerate(nb.get('cells', [])):
+        for output in cell.get('outputs', []):
+            for line in output.get('text', []):
+                if re.search(r'${pattern}', line):
+                    print(f'  cell #{i+1} output: {line.rstrip()}')
+except Exception:
+    pass
+" 2>/dev/null || true)
+      if [[ -n "$nb_matches" ]]; then
+        echo "  [SECRET FOUND] Notebook $nb in commit $commit matched pattern: $pattern"
+        echo "$nb_matches" | head -5
+        FOUND=1
+      fi
+    done
+  done
+}
+
+echo "[pre-push] Scanning commits for secrets..."
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # New branch being pushed for the first time
+  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+    range="$local_sha"
+    commits=$(git rev-list "$range" 2>/dev/null || true)
+  else
+    commits=$(git rev-list "${remote_sha}..${local_sha}" 2>/dev/null || true)
+  fi
+
+  for commit in $commits; do
+    check_diff "$commit"
+  done
+done
+
+if [[ "$FOUND" -eq 1 ]]; then
+  echo ""
+  echo "[pre-push] PUSH BLOCKED: Secret(s) detected in commits above."
+  echo "           Remove the secret, amend/rebase the commit, then push again."
+  exit 1
+fi
+
+echo "[pre-push] No secrets detected. Push allowed."
+exit 0
